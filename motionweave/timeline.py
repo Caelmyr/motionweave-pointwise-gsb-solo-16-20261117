@@ -69,6 +69,23 @@ def matrix_at(item, source_seconds, source_size, canvas_size):
                      [sine, cosine, cy - sine*width/2 - cosine*height/2]], dtype=np.float64)
 
 
+def _trim_tracking(item, first=None, last=None):
+    """Keep only reliability rows for source frames the clip still covers."""
+    record = item.get('tracking')
+    if not record or not record.get('frames'):
+        return
+    src_frames = record['frames']
+    if first is None:
+        first = min(row['frame'] for row in src_frames)
+    if last is None:
+        last = max(row['frame'] for row in src_frames)
+    record['frames'] = [row for row in src_frames if first <= row['frame'] <= last]
+    if 'first' in record:
+        record['first'] = max(record['first'], first)
+    if 'last' in record:
+        record['last'] = min(record['last'], last)
+
+
 def split(doc, clip_id, time):
     item = find(doc['clips'], clip_id)
     time = number(time, '切割时间', item['start'], item['start'] + item['length'])
@@ -87,6 +104,12 @@ def split(doc, clip_id, time):
     else:
         item['out'] = cut
         right['in'] = cut
+    src = find(doc['sources'], item['source'])
+    cut_index = frame_at(src, cut)[0]
+    # Mask keyframes are shared source-time data; only the reliability report
+    # is windowed to the frames each resulting clip still covers.
+    _trim_tracking(item, last=cut_index - 1)
+    _trim_tracking(right, first=cut_index)
     doc['clips'].append(right)
     return right['id']
 

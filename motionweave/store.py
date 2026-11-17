@@ -11,10 +11,21 @@ from . import model
 from .model import Invalid, Conflict, find
 from .render import decode, png
 from .timeline import split, duplicate, ripple_delete, edit_clip
+from . import tracker
 
 
 def fingerprint(doc):
     return hashlib.sha256(json.dumps(model.content(doc), sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
+def fingerprint_without_annotations(doc):
+    """Fingerprint ignoring read-only tracking.stale UI annotations."""
+    clean = copy.deepcopy(doc)
+    for item in clean.get('clips', []):
+        record = item.get('tracking')
+        if record and 'stale' in record:
+            del record['stale']
+    return fingerprint(clean)
 
 
 class Store:
@@ -54,12 +65,29 @@ class Store:
 
     def get(self, key):
         with self.lock:
-            return self.read(self.directory(key) / 'project.json')
+            doc = self.read(self.directory(key) / 'project.json')
+            self._annotate_stale(doc)
+            return doc
 
     def list(self):
         with self.lock:
-            return sorted([self.read(p) for p in self.projects.glob('*/project.json')],
+            docs = sorted([self.read(p) for p in self.projects.glob('*/project.json')],
                           key=lambda item: item['created'], reverse=True)
+            for doc in docs:
+                self._annotate_stale(doc)
+            return docs
+
+    def _annotate_stale(self, doc):
+        """Flag tracking records whose source frames were replaced afterwards."""
+        for item in doc.get('clips', []):
+            record = item.get('tracking')
+            if not record:
+                continue
+            try:
+                src = find(doc['sources'], item['source'])
+                record['stale'] = tracker.tracking_is_stale(src, record)
+            except Invalid:
+                record['stale'] = False
 
     def create(self, name='未命名动画', width=640, height=360, fps=12):
         doc = model.document(name, width, height, fps)
@@ -87,6 +115,7 @@ class Store:
             working = copy.deepcopy(before)
             yield working
             model.validate(working)
+            # validate() rebuilds records and drops the read-only stale flag.
             history_id = model.uid()
             entry = {'id': history_id, 'operation': operation,
                      'before': model.content(before), 'after': model.content(working), 'time': model.timestamp()}
@@ -149,6 +178,39 @@ class Store:
                 raise Invalid('未知片段操作')
         return self.get(key)
 
+    def track_clip(self, key, revision, clip_id, first=None, last=None):
+        with self.lock:
+            doc = self.get(key)
+            if doc['revision'] != revision:
+                raise Conflict('工程已更新，请刷新')
+            item = find(doc['clips'], clip_id)
+            src = find(doc['sources'], item['source'])
+            window_first, window_last = tracker.clip_frame_window(src, item)
+            first = window_first if first is None else model.integer(first, '起始帧', 0, len(src['frames']) - 1)
+            last = window_last if last is None else model.integer(last, '结束帧', 0, len(src['frames']) - 1)
+            if last < first:
+                raise Invalid('跟踪结束帧不能早于起始帧')
+            if not (window_first <= first and last <= window_last):
+                raise Invalid('跟踪范围必须落在片段入出点覆盖的源帧内')
+            if not item['mask']:
+                raise Invalid('请先在一帧上圈定遮罩区域作为跟踪起点')
+            images = tracker.load_images(self.assets, src['frames'])
+            keyframes, report = tracker.track(src['frames'], images, item['mask'], first, last)
+            signature = tracker.source_signature(src)
+            with self.edit(key, revision, '遮罩跟踪') as working:
+                target = find(working['clips'], clip_id)
+                source_times = tracker.frame_times(src['frames'])
+                # Merge: replace keyframes inside the window, keep anything outside.
+                outside = [k for k in target['mask']
+                           if not (first <= tracker._frame_index(source_times, k['time']) <= last)]
+                target['mask'] = sorted(outside + keyframes, key=lambda k: k['time'])
+                target['tracking'] = {'frames': report,
+                                      'source_revision': working['revision'],
+                                      'source_signature': signature,
+                                      'tracked_at': model.timestamp(),
+                                      'first': first, 'last': last}
+        return self.get(key)
+
     def travel(self, key, revision, redo=False):
         with self.lock:
             current = self.get(key)
@@ -173,12 +235,17 @@ class Store:
             doc = self.get(key)
             if doc['revision'] != revision:
                 raise Conflict('工程已更新')
-            return copy.deepcopy(doc), fingerprint(doc)
+            frozen = copy.deepcopy(doc)
+            # The stale flag is a read-time UI annotation, not document content.
+            for item in frozen.get('clips', []):
+                if item.get('tracking') and 'stale' in item['tracking']:
+                    del item['tracking']['stale']
+            return frozen, fingerprint_without_annotations(frozen)
 
     def capture_commit(self, key, captured, signature, folder, metadata):
         with self.lock:
             current = self.get(key)
-            if fingerprint(current) != signature:
+            if fingerprint_without_annotations(current) != signature:
                 shutil.rmtree(folder, ignore_errors=True)
                 raise Conflict('渲染期间工程内容改变，未发布旧结果')
             capture_id = Path(folder).name
@@ -202,13 +269,19 @@ class Store:
 
     def demo(self):
         doc = self.create('合成演示 · 轨道与倒放', 480, 270, 8)
+        # Deterministic texture that moves with the orange block so feature
+        # tracking has corners to lock onto.
+        rng = np.random.default_rng(11)
+        block_texture = rng.integers(0, 90, (60, 32, 3), dtype=np.uint8)
+        block_texture[::4, :] = 0
         frames = []
         for index in range(8):
             image = np.zeros((180, 240, 4), dtype=np.uint8)
             image[..., :3] = [34, 65, 91]
             image[..., 3] = 255
             x = 20 + index*23
-            image[40:100, x:x+32, :3] = [255, 178, 50]
+            image[40:100, x:x+32, :3] = np.clip(
+                np.array([255, 178, 50], dtype=np.uint8) - block_texture, 0, 255)
             image[110:150, 40:200, :3] = [44, 190, 160]
             frame = self.asset(png(image))
             frame['duration'] = .25 if index % 2 == 0 else .5
@@ -217,9 +290,13 @@ class Store:
         src = doc['sources'][0]
         doc = self.add_clip(doc['id'], doc['revision'], src['id'])
         item = doc['clips'][0]
+        # Tight mask around the moving textured block (source image is 240x180).
+        def block_mask(x):
+            return [[(x - 4) / 240, 36 / 180], [(x + 36) / 240, 36 / 180],
+                    [(x + 36) / 240, 104 / 180], [(x - 4) / 240, 104 / 180]]
         doc = self.clip_action(doc['id'], doc['revision'], item['id'], 'edit', {
             'length': 4., 'transform': [{'time': 0., 'x': -25., 'y': 0., 'scale': .8, 'angle': -8.},
                                      {'time': 3., 'x': 25., 'y': 0., 'scale': 1., 'angle': 12.}],
-            'mask': [{'time': 0., 'points': [[.02,.02],[.98,.02],[.98,.98],[.02,.98]]},
-                     {'time': 3., 'points': [[.15,.05],[.9,.05],[.9,.95],[.15,.95]]}], 'feather': 2.})
+            'mask': [{'time': 0., 'points': block_mask(20)},
+                     {'time': 3., 'points': block_mask(20 + 7 * 23)}], 'feather': 2.})
         return doc

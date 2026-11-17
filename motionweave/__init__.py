@@ -81,6 +81,10 @@ def install(app, root):
     @app.post('/motion/projects/<key>/clips/<clip_id>/<action>')
     def action(key, clip_id, action):
         data = body()
+        if action == 'track':
+            return jsonify(store.track_clip(
+                key, data.pop('revision'), clip_id,
+                data.get('first'), data.get('last')))
         return jsonify(store.clip_action(key, data.pop('revision'), clip_id, action, data))
 
     @app.post('/motion/projects/<key>/<action>')

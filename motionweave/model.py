@@ -78,7 +78,7 @@ def clip(source_id, duration, start=0, lane=0):
             'reverse': False, 'lane': int(lane), 'enabled': True,
             'blend': 'normal', 'opacity': 1.,
             'transform': [{'time': 0., 'x': 0., 'y': 0., 'scale': 1., 'angle': 0.}],
-            'mask': [], 'feather': 0.}
+            'mask': [], 'feather': 0., 'tracking': None}
 
 
 def validate_transform(keys):
@@ -99,7 +99,7 @@ def validate_transform(keys):
 
 
 def validate_masks(keys):
-    if not isinstance(keys, list) or len(keys) > 100:
+    if not isinstance(keys, list) or len(keys) > 120:
         raise Invalid('遮罩关键帧数量不合法')
     result = []
     times = set()
@@ -115,8 +115,65 @@ def validate_masks(keys):
         if vertices is not None and vertices != len(points):
             raise Invalid('同一遮罩各关键帧顶点对应关系必须一致')
         vertices = len(points)
-        result.append({'time': time, 'points': [[number(p[0], '遮罩X', -4, 4), number(p[1], '遮罩Y', -4, 4)] for p in points]})
+        entry = {'time': time,
+                 'points': [[number(p[0], '遮罩X', -4, 4), number(p[1], '遮罩Y', -4, 4)] for p in points]}
+        # Tracking metadata is optional: hand-written masks without it stay valid.
+        if 'confidence' in key and key['confidence'] is not None:
+            entry['confidence'] = number(key['confidence'], '跟踪置信度', 0, 1)
+        origin = key.get('origin', 'manual')
+        if origin not in ['manual', 'track']:
+            raise Invalid('遮罩关键帧来源不合法')
+        entry['origin'] = origin
+        for name, low, high in [('inliers', 0, 100000), ('matches', 0, 100000)]:
+            if key.get(name) is not None:
+                entry[name] = integer(key[name], name, low, high)
+        if key.get('error') is not None:
+            entry['error'] = number(key['error'], '重投影误差', 0, 1000)
+        result.append(entry)
     return sorted(result, key=lambda item: item['time'])
+
+
+def validate_tracking(value):
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise Invalid('跟踪记录不合法')
+    states = {'untracked', 'anchor', 'reliable', 'marginal', 'failed'}
+    frames = value.get('frames')
+    if not isinstance(frames, list) or len(frames) > 120:
+        raise Invalid('跟踪帧记录不合法')
+    rows = []
+    for row in frames:
+        state = row.get('state')
+        if state not in states:
+            raise Invalid('跟踪状态不合法')
+        confidence = row.get('confidence')
+        if confidence is not None:
+            confidence = number(confidence, '跟踪置信度', 0, 1)
+        error = row.get('error')
+        if error is not None:
+            error = number(error, '重投影误差', 0, 1000)
+        rows.append({'frame': integer(row['frame'], '帧序号', 0, 119),
+                     'time': number(row['time'], '源时间', 0, 7200),
+                     'state': state, 'confidence': confidence,
+                     'inliers': integer(row.get('inliers', 0), '内点数', 0, 100000),
+                     'matches': integer(row.get('matches', 0), '匹配数', 0, 100000),
+                     'error': error, 'anchor': bool(row.get('anchor', False))})
+    out = {'frames': rows}
+    if value.get('source_revision') is not None:
+        out['source_revision'] = integer(value['source_revision'], '源版本', 0, 10 ** 9)
+    signature = value.get('source_signature')
+    if signature is not None:
+        if not isinstance(signature, str) or len(signature) != 64 or any(c not in '0123456789abcdef' for c in signature):
+            raise Invalid('源指纹不合法')
+        out['source_signature'] = signature
+    if value.get('tracked_at') is not None:
+        out['tracked_at'] = str(value['tracked_at'])[:60]
+    if value.get('first') is not None:
+        out['first'] = integer(value['first'], '跟踪起始帧', 0, 119)
+    if value.get('last') is not None:
+        out['last'] = integer(value['last'], '跟踪结束帧', 0, 119)
+    return out
 
 
 def validate(doc):
@@ -141,6 +198,7 @@ def validate(doc):
             raise Invalid('未知混合方式')
         item['transform'] = validate_transform(item['transform'])
         item['mask'] = validate_masks(item['mask'])
+        item['tracking'] = validate_tracking(item.get('tracking'))
     duration = max([c['start'] + c['length'] for c in doc['clips']] or [0])
     if duration * doc['fps'] > 3600:
         raise Invalid('工程最多3600输出帧')
