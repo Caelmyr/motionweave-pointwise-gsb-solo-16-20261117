@@ -1,0 +1,10 @@
+services:
+  motionweave:
+    build: .
+    image: solo19-motionweave:1.0
+    ports: ["18919:18919"]
+    volumes: ["motionweave-data:/data"]
+    restart: unless-stopped
+volumes:
+  motionweave-data:
+    name: solo19-motionweave-data
